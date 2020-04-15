@@ -39,6 +39,7 @@ import (
 	tddl "github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/segmentio/fasthash/fnv1a"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
@@ -62,7 +63,7 @@ type mysqlSink struct {
 	globalForwardCh chan struct{}
 
 	unresolvedRowsMu sync.Mutex
-	unresolvedRows   map[string][]*model.RowChangedEvent
+	unresolvedRows   map[int][]*model.RowChangedEvent
 
 	count uint64
 
@@ -96,8 +97,15 @@ func (s *mysqlSink) EmitRowChangedEvent(ctx context.Context, rows ...*model.RowC
 			log.Info("Row changed event ignored", zap.Uint64("ts", row.Ts))
 			continue
 		}
-		key := util.QuoteSchema(row.Schema, row.Table)
-		s.unresolvedRows[key] = append(s.unresolvedRows[key], row)
+		var queueBucket int
+		for _, col := range row.Columns {
+			if *col.WhereHandle {
+				h := fnv1a.HashString64(fmt.Sprintf("%v", col.Value))
+				queueBucket = int(h) % s.params.workerCount
+				break
+			}
+		}
+		s.unresolvedRows[queueBucket] = append(s.unresolvedRows[queueBucket], row)
 	}
 	if resolvedTs != 0 {
 		atomic.StoreUint64(&s.sinkResolvedTs, resolvedTs)
@@ -214,8 +222,8 @@ func (s *mysqlSink) Run(ctx context.Context) error {
 	}
 }
 
-func splitRowsGroup(resolvedTs uint64, unresolvedRows map[string][]*model.RowChangedEvent) (minTs uint64, resolvedRowsMap map[string][]*model.RowChangedEvent) {
-	resolvedRowsMap = make(map[string][]*model.RowChangedEvent, len(unresolvedRows))
+func splitRowsGroup(resolvedTs uint64, unresolvedRows map[int][]*model.RowChangedEvent) (minTs uint64, resolvedRowsMap map[int][]*model.RowChangedEvent) {
+	resolvedRowsMap = make(map[int][]*model.RowChangedEvent, len(unresolvedRows))
 	minTs = resolvedTs
 	for key, rows := range unresolvedRows {
 		i := sort.Search(len(rows), func(i int) bool {
@@ -333,7 +341,7 @@ func newMySQLSink(sinkURI *url.URL, dsn *dmysql.Config, filter *util.Filter, opt
 
 	sink := &mysqlSink{
 		db:              db,
-		unresolvedRows:  make(map[string][]*model.RowChangedEvent),
+		unresolvedRows:  make(map[int][]*model.RowChangedEvent),
 		params:          params,
 		filter:          filter,
 		globalForwardCh: make(chan struct{}, 1),
@@ -348,7 +356,7 @@ func newMySQLSink(sinkURI *url.URL, dsn *dmysql.Config, filter *util.Filter, opt
 	return sink, nil
 }
 
-func (s *mysqlSink) concurrentExec(ctx context.Context, rowGroups map[string][]*model.RowChangedEvent) error {
+func (s *mysqlSink) concurrentExec(ctx context.Context, rowGroups map[int][]*model.RowChangedEvent) error {
 	jobs := make(chan []*model.RowChangedEvent, len(rowGroups))
 	for _, dmls := range rowGroups {
 		jobs <- dmls
