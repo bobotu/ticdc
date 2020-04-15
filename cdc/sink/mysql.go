@@ -99,7 +99,7 @@ func (s *mysqlSink) EmitRowChangedEvent(ctx context.Context, rows ...*model.RowC
 		}
 		var queueBucket int
 		for _, col := range row.Columns {
-			if *col.WhereHandle {
+			if col.WhereHandle != nil && *col.WhereHandle {
 				h := fnv1a.HashString64(fmt.Sprintf("%v", col.Value))
 				queueBucket = int(h) % s.params.workerCount
 				break
